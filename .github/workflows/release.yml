@@ -1,0 +1,141 @@
+name: Build & publish agent
+
+# Pipeline complet au tag git v* :
+#   1. Build le binaire Go (linux-amd64)
+#   2. Push le binaire sur le SaaS via POST /api/admin/agent-releases
+#   3. Build l'image Docker wrapper et la push sur ghcr.io
+#
+# Pre-requis : 2 GitHub Secrets a configurer dans le repo agent :
+#   - BEEBOOP_SAAS_URL : URL du SaaS, ex https://app.beeboop.net
+#   - BEEBOOP_AGENT_RELEASES_TOKEN : meme valeur que cote SaaS .env
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: beeboop-net/agent
+
+jobs:
+  build-binary:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Resolve version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="dev-${GITHUB_SHA:0:7}"
+          else
+            VERSION="${GITHUB_REF_NAME#v}"
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Build binary linux-amd64
+        run: |
+          mkdir -p dist
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+            -ldflags="-s -w -X main.version=${{ steps.version.outputs.version }}" \
+            -o dist/dbtm-agent-linux-amd64 \
+            ./cmd/agent
+          tar -czf dist/dbtm-agent-linux-amd64.tar.gz -C dist dbtm-agent-linux-amd64
+          rm dist/dbtm-agent-linux-amd64
+
+      - name: Upload binary to SaaS
+        env:
+          BEEBOOP_SAAS_URL: ${{ secrets.BEEBOOP_SAAS_URL }}
+          BEEBOOP_AGENT_RELEASES_TOKEN: ${{ secrets.BEEBOOP_AGENT_RELEASES_TOKEN }}
+        run: |
+          # Pour les workflow_dispatch builds (dev-XXX), on n'upload pas
+          # — c'est juste pour test build local.
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "Skip upload pour build dev (workflow_dispatch)."
+            exit 0
+          fi
+
+          curl -fSL -X POST "${BEEBOOP_SAAS_URL}/api/admin/agent-releases" \
+            -H "Authorization: Bearer ${BEEBOOP_AGENT_RELEASES_TOKEN}" \
+            -F "version=v${{ steps.version.outputs.version }}" \
+            -F "binary=@dist/dbtm-agent-linux-amd64.tar.gz" \
+            -F "mark_latest=1" \
+            --fail-with-body
+
+      - name: Upload binary as artifact (pour le job docker suivant)
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-binary
+          path: dist/dbtm-agent-linux-amd64.tar.gz
+          retention-days: 1
+
+  build-docker:
+    needs: build-binary
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'  # Skip docker pour workflow_dispatch (dev builds)
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Pre-flight : verifie que le binaire est dispo cote SaaS releases.
+      # Si le job upload precedent a echoue, ne va pas plus loin.
+      - name: Pre-flight check binaire SaaS
+        run: |
+          URL="https://releases.beeboop.net/agent/v${{ needs.build-binary.outputs.version }}/dbtm-agent-linux-amd64.tar.gz"
+          if ! curl -fsI -o /dev/null "$URL"; then
+            echo "ERREUR : binaire pas dispo a $URL"
+            exit 1
+          fi
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            AGENT_VERSION=${{ needs.build-binary.outputs.version }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Generate artifact attestation
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
