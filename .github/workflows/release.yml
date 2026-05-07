@@ -36,7 +36,7 @@ jobs:
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             VERSION="dev-${GITHUB_SHA:0:7}"
           else
-            VERSION="${GITHUB_REF_NAME#v}"
+            VERSION="${GITHUB_REF_NAME}"
           fi
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
@@ -45,7 +45,7 @@ jobs:
         # le build. Si le binaire n'existe pas, le docker build plante.
         # On verifie en amont pour donner un message d'erreur clair.
         run: |
-          URL="https://releases.beeboop.net/agent/v${{ steps.version.outputs.version }}/dbtm-agent-linux-amd64.tar.gz"
+          URL="https://releases.beeboop.net/agent/${{ steps.version.outputs.version }}/dbtm-agent-linux-amd64.tar.gz"
           if ! curl -fsLI -o /dev/null "$URL"; then
             echo "ERREUR : binaire pas dispo a $URL"
             echo "  -> declenche le workflow build-agent.yml sur Draz34/backup-restore"
