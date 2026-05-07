@@ -39,5 +39,5 @@ Logiciel propriétaire BeeBoop. Voir [LICENSE](./LICENSE).
 
 ## Support
 
-- Documentation : https://beeboop.net/docs
-- Contact : support@beeboop.net
+- Documentation : https://www.beeboop.net/docs
+- Contact : https://www.beeboop.net/contact
