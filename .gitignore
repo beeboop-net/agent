@@ -1,0 +1,17 @@
+# Binaire compile (regenere par la CI a chaque release)
+/agent
+/dbtm-agent
+/dbtm-agent-linux-amd64
+/dist/
+*.tar.gz
+# Fichiers locaux
+.env
+.env.local
+# Editor / OS
+.DS_Store
+*.swp
+*.swo
+.vscode/
+.idea/
+# Go
+vendor/
