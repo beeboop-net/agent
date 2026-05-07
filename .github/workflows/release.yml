@@ -1,13 +1,13 @@
-name: Build & publish agent
+name: Build & publish agent docker image
 
-# Pipeline complet au tag git v* :
-#   1. Build le binaire Go (linux-amd64)
-#   2. Push le binaire sur le SaaS via POST /api/admin/agent-releases
-#   3. Build l'image Docker wrapper et la push sur ghcr.io
+# Pipeline minimaliste : a chaque tag git v* sur ce repo, build et push
+# l'image docker qui WRAP le binaire agent. Le binaire lui-meme N'est
+# PAS build ici — il est publie sur releases.beeboop.net depuis le repo
+# Draz34/backup-restore (workflow build-agent.yml de ce repo).
 #
-# Pre-requis : 2 GitHub Secrets a configurer dans le repo agent :
-#   - BEEBOOP_SAAS_URL : URL du SaaS, ex https://app.beeboop.net
-#   - BEEBOOP_AGENT_RELEASES_TOKEN : meme valeur que cote SaaS .env
+# Pre-requis avant de tagger ici : le binaire de la version cible doit
+# DEJA exister sur releases.beeboop.net/agent/<version>/... sinon le
+# Dockerfile (qui pull ce binaire) plante en pre-flight check.
 
 on:
   push:
@@ -19,16 +19,16 @@ env:
   IMAGE_NAME: beeboop-net/agent
 
 jobs:
-  build-binary:
+  build-docker:
     runs-on: ubuntu-latest
-    outputs:
-      version: ${{ steps.version.outputs.version }}
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+
     steps:
       - uses: actions/checkout@v4
-
-      - uses: actions/setup-go@v5
-        with:
-          go-version: '1.22'
 
       - name: Resolve version
         id: version
@@ -40,54 +40,18 @@ jobs:
           fi
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
-      - name: Build binary linux-amd64
+      - name: Pre-flight check binaire SaaS
+        # Le Dockerfile pull le binaire depuis releases.beeboop.net pendant
+        # le build. Si le binaire n'existe pas, le docker build plante.
+        # On verifie en amont pour donner un message d'erreur clair.
         run: |
-          mkdir -p dist
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
-            -ldflags="-s -w -X main.version=${{ steps.version.outputs.version }}" \
-            -o dist/dbtm-agent-linux-amd64 \
-            ./cmd/agent
-          tar -czf dist/dbtm-agent-linux-amd64.tar.gz -C dist dbtm-agent-linux-amd64
-          rm dist/dbtm-agent-linux-amd64
-
-      - name: Upload binary to SaaS
-        env:
-          BEEBOOP_SAAS_URL: ${{ secrets.BEEBOOP_SAAS_URL }}
-          BEEBOOP_AGENT_RELEASES_TOKEN: ${{ secrets.BEEBOOP_AGENT_RELEASES_TOKEN }}
-        run: |
-          # Pour les workflow_dispatch builds (dev-XXX), on n'upload pas
-          # — c'est juste pour test build local.
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "Skip upload pour build dev (workflow_dispatch)."
-            exit 0
+          URL="https://releases.beeboop.net/agent/v${{ steps.version.outputs.version }}/dbtm-agent-linux-amd64.tar.gz"
+          if ! curl -fsLI -o /dev/null "$URL"; then
+            echo "ERREUR : binaire pas dispo a $URL"
+            echo "  -> declenche le workflow build-agent.yml sur Draz34/backup-restore"
+            echo "     pour version v${{ steps.version.outputs.version }} avant de retagger ici."
+            exit 1
           fi
-
-          curl -fSL -X POST "${BEEBOOP_SAAS_URL}/api/admin/agent-releases" \
-            -H "Authorization: Bearer ${BEEBOOP_AGENT_RELEASES_TOKEN}" \
-            -F "version=v${{ steps.version.outputs.version }}" \
-            -F "binary=@dist/dbtm-agent-linux-amd64.tar.gz" \
-            -F "mark_latest=1" \
-            --fail-with-body
-
-      - name: Upload binary as artifact (pour le job docker suivant)
-        uses: actions/upload-artifact@v4
-        with:
-          name: agent-binary
-          path: dist/dbtm-agent-linux-amd64.tar.gz
-          retention-days: 1
-
-  build-docker:
-    needs: build-binary
-    runs-on: ubuntu-latest
-    if: github.event_name == 'push'  # Skip docker pour workflow_dispatch (dev builds)
-    permissions:
-      contents: read
-      packages: write
-      id-token: write
-      attestations: write
-
-    steps:
-      - uses: actions/checkout@v4
 
       - uses: docker/setup-buildx-action@v3
 
@@ -97,16 +61,6 @@ jobs:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      # Pre-flight : verifie que le binaire est dispo cote SaaS releases.
-      # Si le job upload precedent a echoue, ne va pas plus loin.
-      - name: Pre-flight check binaire SaaS
-        run: |
-          URL="https://releases.beeboop.net/agent/v${{ needs.build-binary.outputs.version }}/dbtm-agent-linux-amd64.tar.gz"
-          if ! curl -fsI -o /dev/null "$URL"; then
-            echo "ERREUR : binaire pas dispo a $URL"
-            exit 1
-          fi
 
       - name: Extract Docker metadata
         id: meta
@@ -127,7 +81,7 @@ jobs:
           platforms: linux/amd64
           push: true
           build-args: |
-            AGENT_VERSION=${{ needs.build-binary.outputs.version }}
+            AGENT_VERSION=${{ steps.version.outputs.version }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
