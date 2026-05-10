@@ -1,57 +1,106 @@
-name: Build & publish agent docker image
+name: Build & publish agent
 
-# Pipeline minimaliste : a chaque tag git v* sur ce repo, build et push
-# l'image docker qui WRAP le binaire agent. Le binaire lui-meme N'est
-# PAS build ici — il est publie sur releases.beeboop.net depuis le repo
-# Draz34/backup-restore (workflow build-agent.yml de ce repo).
+# Pipeline du repo beeboop-net/agent au tag git v* :
+#   1. Build & publish des binaires : DEPRECATED. Le pipeline canonique
+#      est dans Draz34/backup-restore .github/workflows/deploy.yml qui
+#      build les 8 profils et les publie via php artisan agent:publish
+#      (bypass complet de l'API publique pour eviter Cloudflare Bot Fight
+#      Mode qui bloque les IP des runners GHA). Ce workflow ici se borne
+#      maintenant au build des images Docker wrapper.
 #
-# Pre-requis avant de tagger ici : le binaire de la version cible doit
-# DEJA exister sur releases.beeboop.net/agent/<version>/... sinon le
-# Dockerfile (qui pull ce binaire) plante en pre-flight check.
+#   2. Build des 8 images Docker wrapper (matrix par profil) qui pullent
+#      le binaire pre-publie depuis releases.beeboop.net et le bake dans
+#      l'image. Tagging :
+#        ghcr.io/beeboop-net/agent:v1.0.4-readonly
+#        ghcr.io/beeboop-net/agent:v1.0.4-sql-read
+#        ghcr.io/beeboop-net/agent:v1.0.4-sql-rw
+#        ghcr.io/beeboop-net/agent:v1.0.4-sql-admin
+#        ghcr.io/beeboop-net/agent:v1.0.4-ssh
+#        ghcr.io/beeboop-net/agent:v1.0.4-sql-read-ssh
+#        ghcr.io/beeboop-net/agent:v1.0.4-sql-rw-ssh
+#        ghcr.io/beeboop-net/agent:v1.0.4-full
+#        ghcr.io/beeboop-net/agent:latest-<profil>
+#
+# Pre-requis :
+#   - Avoir merge sur main du repo backup-restore avec le bump VERSION agent
+#   - Le CI backup-restore a publie les 8 binaires sur releases.beeboop.net
+#     avant que ce workflow tourne (le pre-flight check verifie chacun).
+#
+# Cas d'usage des images Docker bakees :
+#   - Self-hosted en environnement air-gapped (pas de download runtime)
+#   - Override BEEBOOP_DBTM_AGENT_IMAGE cote SaaS pour forcer une image
+#     specifique (cf. config/services.php dbtm_agent.image)
+# Pour le mode Compute sidecar standard, ces images NE sont PAS utilisees
+# (le sidecar pull dynamiquement le bon profil au boot via alpine + curl).
 
 on:
   push:
     tags: ['v*']
   workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version a builder (ex: v1.0.4). Si vide, prend le dernier tag.'
+        required: false
+        type: string
 
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: beeboop-net/agent
 
 jobs:
+  resolve-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Resolve version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ inputs.version }}"
+            if [ -z "$VERSION" ]; then
+              echo "ERREUR : workflow_dispatch sans inputs.version. Specifie une version (ex: v1.0.4)."
+              exit 1
+            fi
+          else
+            VERSION="${GITHUB_REF_NAME}"
+          fi
+          # Normalise pour avoir le prefix v (releases.beeboop.net stocke
+          # avec le 'v' dans le path).
+          case "$VERSION" in
+            v*) ;;
+            *)  VERSION="v${VERSION}" ;;
+          esac
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Version cible : $VERSION"
+
   build-docker:
+    needs: resolve-version
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
       id-token: write
       attestations: write
+    strategy:
+      fail-fast: false
+      # Matrice des 8 profils — alignee sur AgentRelease::PROFILES cote SaaS.
+      # Si on ajoute un profil cote SaaS, il faut l'ajouter ici aussi (et
+      # vice-versa). C'est la double source de verite ; un check CI cote
+      # backup-restore valide leur alignement.
+      matrix:
+        variant:
+          - readonly
+          - sql-read
+          - sql-rw
+          - sql-admin
+          - ssh
+          - sql-read-ssh
+          - sql-rw-ssh
+          - full
 
     steps:
       - uses: actions/checkout@v4
-
-      - name: Resolve version
-        id: version
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            VERSION="dev-${GITHUB_SHA:0:7}"
-          else
-            VERSION="${GITHUB_REF_NAME}"
-          fi
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-
-      - name: Pre-flight check binaire SaaS
-        # Le Dockerfile pull le binaire depuis releases.beeboop.net pendant
-        # le build. Si le binaire n'existe pas, le docker build plante.
-        # On verifie en amont pour donner un message d'erreur clair.
-        run: |
-          URL="https://releases.beeboop.net/agent/${{ steps.version.outputs.version }}/dbtm-agent-linux-amd64.tar.gz"
-          if ! curl -fsLI -o /dev/null "$URL"; then
-            echo "ERREUR : binaire pas dispo a $URL"
-            echo "  -> declenche le workflow build-agent.yml sur Draz34/backup-restore"
-            echo "     pour version v${{ steps.version.outputs.version }} avant de retagger ici."
-            exit 1
-          fi
 
       - uses: docker/setup-buildx-action@v3
 
@@ -62,18 +111,49 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Pre-flight : verifie que le binaire de ce profil est dispo cote SaaS.
+      # Le CI backup-restore deploie + publie les 8 profils en sequence.
+      # Si on tourne ce workflow AVANT que backup-restore ait fini de
+      # publier, on echoue clean ici plutot que de docker build sur du
+      # vide. Re-trigger une fois que le SaaS a la release en DB.
+      - name: Pre-flight check binaire SaaS (profil ${{ matrix.variant }})
+        run: |
+          URL="https://releases.beeboop.net/agent/${{ needs.resolve-version.outputs.version }}/dbtm-agent-${{ matrix.variant }}-linux-amd64.tar.gz"
+          if ! curl -fsI -o /dev/null "$URL"; then
+            echo "ERREUR : binaire pas dispo a $URL"
+            echo "  -> declenche le workflow .github/workflows/deploy.yml sur"
+            echo "     Draz34/backup-restore (push main avec bump agent/VERSION)"
+            echo "     pour que les 8 profils soient publies sur releases.beeboop.net"
+            echo "     AVANT de retagger ici."
+            exit 1
+          fi
+          echo "OK : binaire dispo a $URL"
+
       - name: Extract Docker metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # Tags par profil. Le prefix avec semver puis le suffix variant.
+          # Ex pour push tag v1.0.4 + matrix.variant=sql-rw-ssh :
+          #   ghcr.io/beeboop-net/agent:v1.0.4-sql-rw-ssh
+          #   ghcr.io/beeboop-net/agent:1.0.4-sql-rw-ssh
+          #   ghcr.io/beeboop-net/agent:1.0-sql-rw-ssh
+          #   ghcr.io/beeboop-net/agent:latest-sql-rw-ssh
           tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
-            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=${{ needs.resolve-version.outputs.version }}-${{ matrix.variant }}
+            type=semver,pattern={{version}}-${{ matrix.variant }}
+            type=semver,pattern={{major}}.{{minor}}-${{ matrix.variant }}
+            type=raw,value=latest-${{ matrix.variant }},enable={{is_default_branch}}
+          # Pour le profil 'full', on tagge AUSSI 'latest' pour la
+          # back-compat (les anciens consumers qui pull ghcr.io/.../agent:latest
+          # recevaient un binaire equivalent au profil 'full' historique).
+          # Si on veut changer ce default un jour, tagger 'latest' sur readonly
+          # serait plus secure (surface minimale par defaut).
+          flavor: |
+            latest=${{ matrix.variant == 'full' }}
 
-      - name: Build and push image
+      - name: Build and push image (profil ${{ matrix.variant }})
         id: build
         uses: docker/build-push-action@v5
         with:
@@ -81,11 +161,12 @@ jobs:
           platforms: linux/amd64
           push: true
           build-args: |
-            AGENT_VERSION=${{ steps.version.outputs.version }}
+            AGENT_VERSION=${{ needs.resolve-version.outputs.version }}
+            AGENT_VARIANT=${{ matrix.variant }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=${{ matrix.variant }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.variant }}
 
       - name: Generate artifact attestation
         uses: actions/attest-build-provenance@v1
