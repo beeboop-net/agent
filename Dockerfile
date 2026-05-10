@@ -56,9 +56,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         curl \
         postgresql-client \
     # ── Agent BeeBoop (depuis releases.beeboop.net, profil parametre) ──
+    # Le binaire INTERIEUR au tarball peut etre soit :
+    #   - dbtm-agent-linux-amd64                  (nouveau format >= v1.0.4 fix)
+    #   - dbtm-agent-${AGENT_VARIANT}-linux-amd64 (ancien format avec suffixe)
+    # On accepte les 2 pour ne pas casser sur les vieilles releases publiees
+    # avant le bump du nom interne.
     && curl -fsSL "https://releases.beeboop.net/agent/${AGENT_VERSION}/dbtm-agent-${AGENT_VARIANT}-linux-amd64.tar.gz" -o /tmp/agent.tar.gz \
     && tar -xzf /tmp/agent.tar.gz -C /tmp \
-    && mv /tmp/dbtm-agent-linux-amd64 /usr/local/bin/beeboop-agent \
+    && if [ -f "/tmp/dbtm-agent-linux-amd64" ]; then \
+         mv "/tmp/dbtm-agent-linux-amd64" /usr/local/bin/beeboop-agent; \
+       elif [ -f "/tmp/dbtm-agent-${AGENT_VARIANT}-linux-amd64" ]; then \
+         mv "/tmp/dbtm-agent-${AGENT_VARIANT}-linux-amd64" /usr/local/bin/beeboop-agent; \
+       else \
+         echo "ERREUR: aucun binaire reconnu dans le tarball pour AGENT_VARIANT=${AGENT_VARIANT}" >&2; \
+         ls -la /tmp/dbtm-agent-* 2>/dev/null || true; \
+         exit 1; \
+       fi \
     && chmod +x /usr/local/bin/beeboop-agent \
     && rm /tmp/agent.tar.gz \
     # ── wal-g binary ───────────────────────────────────────────────────
